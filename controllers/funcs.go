@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 
@@ -33,6 +34,7 @@ const (
 	caBundleSecretNameField = ".spec.tls.caBundleSecretName"
 	tlsAPIInternalField     = ".spec.tls.api.internal.secretName"
 	tlsAPIPublicField       = ".spec.tls.api.public.secretName"
+	transportURLSecretField = ".spec.transportURLSecret"
 	topologyField           = ".spec.topologyRef.Name"
 )
 
@@ -42,11 +44,13 @@ var (
 		caBundleSecretNameField,
 		tlsAPIInternalField,
 		tlsAPIPublicField,
+		transportURLSecretField,
 		topologyField,
 	}
 	ironicConductorWatchFields = []string{
 		passwordSecretField,
 		caBundleSecretNameField,
+		transportURLSecretField,
 		topologyField,
 	}
 	ironicInspectorWatchFields = []string{

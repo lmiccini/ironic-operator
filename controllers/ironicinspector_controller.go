@@ -54,6 +54,7 @@ import (
 
 	labels "github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 
+	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	ironicv1 "github.com/openstack-k8s-operators/ironic-operator/api/v1beta1"
 	keystonev1 "github.com/openstack-k8s-operators/keystone-operator/api/v1beta1"
 
@@ -369,6 +370,7 @@ func (r *IronicInspectorReconciler) SetupWithManager(
 		Owns(&corev1.Secret{}).
 		Owns(&routev1.Route{}).
 		Owns(&corev1.Service{}).
+		Owns(&rabbitmqv1.TransportURL{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).

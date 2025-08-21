@@ -38,6 +38,7 @@ function common_ironic_config {
     # Secrets are obtained from ENV variables.
     export IRONICPASSWORD=${IronicPassword:?"Please specify a IronicPassword variable."}
     export TRANSPORTURL=${TransportURL:-""}
+    export QUORUMQUEUES=${QuorumQueues:-"false"}
     # TODO: nova password
     #export NOVAPASSWORD=${NovaPassword:?"Please specify a NovaPassword variable."}
 
@@ -64,6 +65,11 @@ function common_ironic_config {
     if [ -n "$TRANSPORTURL" ]; then
         crudini --set ${SVC_CFG_MERGED} DEFAULT transport_url $TRANSPORTURL
         crudini --set ${SVC_CFG_MERGED} DEFAULT rpc_transport oslo
+       if $QUORUMQUEUES; then
+               crudini --set ${SVC_CFG_MERGED} oslo_messaging_rabbit rabbit_quorum_queue true
+               crudini --set ${SVC_CFG_MERGED} oslo_messaging_rabbit rabbit_transient_quorum_queue true
+               crudini --set ${SVC_CFG_MERGED} oslo_messaging_rabbit amqp_durable_queues true
+       fi
     fi
     crudini --set ${SVC_CFG_MERGED} keystone_authtoken password $IRONICPASSWORD
     crudini --set ${SVC_CFG_MERGED} service_catalog password $IRONICPASSWORD

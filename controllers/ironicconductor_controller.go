@@ -231,6 +231,18 @@ func (r *IronicConductorReconciler) SetupWithManager(ctx context.Context, mgr ct
 		return err
 	}
 
+	// index transportURLSecretField
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &ironicv1.IronicConductor{}, transportURLSecretField, func(rawObj client.Object) []string {
+		// Extract the secret name from the spec, if one is provided
+		cr := rawObj.(*ironicv1.IronicConductor)
+		if cr.Spec.TransportURLSecret == "" {
+			return nil
+		}
+		return []string{cr.Spec.TransportURLSecret}
+	}); err != nil {
+		return err
+	}
+
 	// index topologyField
 	if err := mgr.GetFieldIndexer().IndexField(ctx, &ironicv1.IronicConductor{}, topologyField, func(rawObj client.Object) []string {
 		// Extract the topology name from the spec, if one is provided

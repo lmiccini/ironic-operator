@@ -23,6 +23,7 @@ export PODINDEX=$(echo ${HOSTNAME##*-})
 # Get required environment variables
 IRONICPASSWORD=${IronicPassword:-""}
 TRANSPORTURL=${TransportURL:-""}
+QUORUMQUEUES=${QuorumQueues:-"false"}
 
 INIT_CONFIG="/var/lib/config-data/merged/03-init-container-conductor.conf"
 
@@ -34,6 +35,11 @@ fi
 if [ -n "${TRANSPORTURL}" ]; then
     crudini --set ${INIT_CONFIG} DEFAULT transport_url ${TRANSPORTURL}
     crudini --set ${INIT_CONFIG} DEFAULT rpc_transport oslo
+    if ${QUORUMQUEUES}; then
+        crudini --set ${INIT_CONFIG} oslo_messaging_rabbit rabbit_quorum_queue true
+        crudini --set ${INIT_CONFIG} oslo_messaging_rabbit rabbit_transient_quorum_queue true
+        crudini --set ${INIT_CONFIG} oslo_messaging_rabbit amqp_durable_queues true
+    fi
 fi
 
 export DEPLOY_HTTP_URL=$(python3 -c 'import os; print(os.environ["DeployHTTPURL"] % os.environ)')
