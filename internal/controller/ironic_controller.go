@@ -307,6 +307,23 @@ func (r *IronicReconciler) reconcileDelete(ctx context.Context, instance *ironic
 		}
 	}
 
+	if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		ironic.TransportConsumerFinalizer,
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+	if instance.Status.NotificationsURLSecret != nil {
+		if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+			ctx, helper, instance.Namespace,
+			*instance.Status.NotificationsURLSecret,
+			ironic.TransportConsumerFinalizer,
+		); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Service is deleted so remove the finalizer.
 	controllerutil.RemoveFinalizer(instance, helper.GetFinalizer())
 	Log.Info("Reconciled Ironic delete successfully")
@@ -333,6 +350,15 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 	// Initialize the IronicConductorReadyCount map
 	instance.Status.IronicConductorReadyCount = make(map[string]int32)
 
+	// mainTransportURL is set inside the oslo block and used at end-of-reconcile
+	// for deferred finalizer cleanup (AC-pattern).
+	var mainTransportURL *rabbitmqv1.TransportURL
+	// transportURLSecretName holds the current (possibly new) transport URL
+	// secret name and is passed to configmap generation and sub-CR creation
+	// instead of instance.Status.TransportURLSecret, so that sub-CRs
+	// immediately pick up a rotated secret.
+	transportURLSecretName := ""
+
 	if instance.Spec.RPCTransport == "oslo" {
 		//
 		// Create RabbitMQ transport URL CR for messaging and get the actual URL from the associated secret
@@ -358,9 +384,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			Log.Info(fmt.Sprintf("TransportURL %s successfully reconciled - operation: %s", transportURL.Name, string(op)))
 		}
 
-		instance.Status.TransportURLSecret = transportURL.Status.SecretName
-
-		if instance.Status.TransportURLSecret == "" {
+		if transportURL.Status.SecretName == "" {
 			Log.Info(fmt.Sprintf("Waiting for TransportURL %s secret to be created", transportURL.Name))
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.RabbitMqTransportURLReadyCondition,
@@ -370,7 +394,26 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			return ctrl.Result{}, nil
 		}
 
+		if err := rabbitmqv1.ManageTransportSecretFinalizer(
+			ctx, helper, instance.Namespace,
+			transportURL.Status.SecretName,
+			ironic.TransportConsumerFinalizer,
+		); err != nil {
+			return ctrl.Result{}, err
+		}
+
 		instance.Status.Conditions.MarkTrue(condition.RabbitMqTransportURLReadyCondition, condition.RabbitMqTransportURLReadyMessage)
+		mainTransportURL = transportURL
+		transportURLSecretName = mainTransportURL.Status.SecretName
+
+		// On initial deployment (status empty) or when the secret hasn't
+		// changed, update status right away so it's visible even if we
+		// return early.  During rotation the old value is kept in status
+		// until the end-of-reconcile guard confirms sub-CRs have rolled.
+		if instance.Status.TransportURLSecret == "" ||
+			instance.Status.TransportURLSecret == transportURLSecretName {
+			instance.Status.TransportURLSecret = transportURLSecretName
+		}
 
 		//
 		// Create notifications TransportURL if configured
@@ -387,6 +430,17 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 		)
 		if err != nil || result.Requeue || result.RequeueAfter > 0 {
 			return result, err
+		}
+		newNotifSecret := ""
+		if instance.Status.NotificationsURLSecret != nil {
+			newNotifSecret = *instance.Status.NotificationsURLSecret
+		}
+		if err := rabbitmqv1.ManageTransportSecretFinalizer(
+			ctx, helper, instance.Namespace,
+			newNotifSecret,
+			ironic.TransportConsumerFinalizer,
+		); err != nil {
+			return ctrl.Result{}, err
 		}
 	} else {
 		instance.Status.TransportURLSecret = ""
@@ -477,7 +531,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 	// - %-config configmap holding minimal ironic config required to get the service up, user can add additional files to be added to the service
 	// - parameters which has passwords gets added from the OpenStack secret via the init container
 	//
-	err = r.generateServiceConfigMaps(ctx, instance, helper, &configMapVars, &keystoneEndpoints, keystoneRegion, db)
+	err = r.generateServiceConfigMaps(ctx, instance, helper, &configMapVars, &keystoneEndpoints, keystoneRegion, db, transportURLSecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -567,6 +621,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			conductorSpec,
 			&keystoneEndpoints,
 			keystoneRegion,
+			transportURLSecretName,
 		)
 		if err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
@@ -577,26 +632,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 				err.Error()))
 			return ctrl.Result{}, err
 		}
-
-		// Check the observed Generation and mirror the condition from the
-		// underlying resource reconciliation
-		cndObsGen, err := r.checkIronicConductorGeneration(instance)
-		if err != nil {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				ironicv1.IronicConductorReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				ironicv1.IronicConductorReadyErrorMessage,
-				err.Error()))
-			return ctrl.Result{}, err
-		}
-		if !cndObsGen {
-			instance.Status.Conditions.Set(condition.UnknownCondition(
-				ironicv1.IronicConductorReadyCondition,
-				condition.InitReason,
-				ironicv1.IronicConductorReadyInitMessage,
-			))
-		} else {
+		if ironicConductor.Generation == ironicConductor.Status.ObservedGeneration {
 			// Mirror IronicConductor status' ReadyCount to this parent CR
 			condGrp := conductorSpec.ConductorGroup
 			if conductorSpec.ConductorGroup == "" {
@@ -611,11 +647,17 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			if op != controllerutil.OperationResultNone {
 				Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicConductor.Name, string(op)))
 			}
+		} else {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				ironicv1.IronicConductorReadyCondition,
+				condition.RequestedReason,
+				condition.SeverityInfo,
+				condition.DeploymentReadyRunningMessage))
 		}
 	}
 
 	// deploy ironic-api
-	ironicAPI, op, err := r.apiDeploymentCreateOrUpdate(instance, &keystoneEndpoints, keystoneRegion)
+	ironicAPI, op, err := r.apiDeploymentCreateOrUpdate(instance, &keystoneEndpoints, keystoneRegion, transportURLSecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			ironicv1.IronicAPIReadyCondition,
@@ -625,28 +667,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			err.Error()))
 		return ctrl.Result{}, err
 	}
-
-	// Check the observed Generation and mirror the condition from the
-	// underlying resource reconciliation
-	apiObsGen, err := r.checkIronicAPIGeneration(instance)
-	if err != nil {
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			ironicv1.IronicAPIReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			ironicv1.IronicAPIReadyErrorMessage,
-			err.Error()))
-		return ctrl.Result{}, err
-	}
-	// Only mirror the underlying condition if the observedGeneration is
-	// the last seen
-	if !apiObsGen {
-		instance.Status.Conditions.Set(condition.UnknownCondition(
-			ironicv1.IronicAPIReadyCondition,
-			condition.InitReason,
-			ironicv1.IronicAPIReadyInitMessage,
-		))
-	} else {
+	if ironicAPI.Generation == ironicAPI.Status.ObservedGeneration {
 		// Mirror IronicAPI status' APIEndpoints and ReadyCount to this parent CR
 		maps.Copy(instance.Status.APIEndpoints, ironicAPI.Status.APIEndpoints)
 		instance.Status.IronicAPIReadyCount = ironicAPI.Status.ReadyCount
@@ -659,6 +680,12 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 		if op != controllerutil.OperationResultNone {
 			Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicAPI.Name, string(op)))
 		}
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			ironicv1.IronicAPIReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	// deploy ironic-inspector
@@ -674,29 +701,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 					err.Error()))
 			return ctrl.Result{}, err
 		}
-
-		// Check the observed Generation and mirror the condition from the
-		// underlying resource reconciliation
-		nspObsGen, err := r.checkIronicInspectorGeneration(instance)
-		if err != nil {
-			instance.Status.Conditions.Set(
-				condition.FalseCondition(
-					ironicv1.IronicInspectorReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					ironicv1.IronicInspectorReadyErrorMessage,
-					err.Error()))
-			return ctrl.Result{}, err
-		}
-		// Only mirror the underlying condition if the observedGeneration is
-		// the last seen
-		if !nspObsGen {
-			instance.Status.Conditions.Set(condition.UnknownCondition(
-				ironicv1.IronicInspectorReadyCondition,
-				condition.InitReason,
-				ironicv1.IronicInspectorReadyInitMessage,
-			))
-		} else {
+		if ironicInspector.Generation == ironicInspector.Status.ObservedGeneration {
 			// Mirror IronicInspector status APIEndpoints and ReadyCount to this parent CR
 			maps.Copy(instance.Status.APIEndpoints, ironicInspector.Status.APIEndpoints)
 			instance.Status.InspectorReadyCount = ironicInspector.Status.ReadyCount
@@ -709,6 +714,12 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			if op != controllerutil.OperationResultNone {
 				Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicInspector.Name, string(op)))
 			}
+		} else {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				ironicv1.IronicInspectorReadyCondition,
+				condition.RequestedReason,
+				condition.SeverityInfo,
+				condition.DeploymentReadyRunningMessage))
 		}
 	} else {
 		err := r.inspectorDeploymentDelete(ctx, instance)
@@ -738,29 +749,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 					err.Error()))
 			return ctrl.Result{}, err
 		}
-
-		// Check the observed Generation and mirror the condition from the
-		// underlying resource reconciliation
-		agObsGen, err := r.checkNeutronAgentGeneration(instance)
-		if err != nil {
-			instance.Status.Conditions.Set(
-				condition.FalseCondition(
-					ironicv1.IronicNeutronAgentReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					ironicv1.IronicNeutronAgentReadyErrorMessage,
-					err.Error()))
-			return ctrl.Result{}, err
-		}
-		// Only mirror the underlying condition if the observedGeneration is
-		// the last seen
-		if !agObsGen {
-			instance.Status.Conditions.Set(condition.UnknownCondition(
-				ironicv1.IronicNeutronAgentReadyCondition,
-				condition.InitReason,
-				ironicv1.IronicNeutronAgentReadyInitMessage,
-			))
-		} else {
+		if ironicNeutronAgent.Generation == ironicNeutronAgent.Status.ObservedGeneration {
 			// Mirror IronicNeutronAgent status ReadyCount to this parent CR
 			instance.Status.IronicNeutronAgentReadyCount = ironicNeutronAgent.Status.ReadyCount
 			// Mirror IronicNeutronAgent's condition status
@@ -771,6 +760,12 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			if op != controllerutil.OperationResultNone {
 				Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicNeutronAgent.Name, string(op)))
 			}
+		} else {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				ironicv1.IronicNeutronAgentReadyCondition,
+				condition.RequestedReason,
+				condition.SeverityInfo,
+				condition.DeploymentReadyRunningMessage))
 		}
 	} else {
 		err := r.ironicNeutronAgentDeploymentDelete(ctx, instance)
@@ -821,6 +816,28 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 		}
 	} else {
 		instance.Status.InspectorApplicationCredentialSecret = instance.Spec.IronicInspector.Auth.ApplicationCredentialSecret
+	}
+
+	// Late phase of the transport secret split pattern: remove the old
+	// transport secret's finalizer and update status only after all
+	// sub-services are ready with the new secret.
+	if mainTransportURL != nil {
+		isTransportRotation := instance.Status.TransportURLSecret != "" &&
+			instance.Status.TransportURLSecret != mainTransportURL.Status.SecretName
+		if isTransportRotation {
+			if instance.Status.Conditions.AllSubConditionIsTrue() {
+				if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+					ctx, helper, instance.Namespace,
+					instance.Status.TransportURLSecret,
+					ironic.TransportConsumerFinalizer,
+				); err != nil {
+					return ctrl.Result{}, err
+				}
+				instance.Status.TransportURLSecret = mainTransportURL.Status.SecretName
+			}
+		} else {
+			instance.Status.TransportURLSecret = mainTransportURL.Status.SecretName
+		}
 	}
 
 	// We reached the end of the Reconcile, update the Ready condition based on
@@ -893,6 +910,7 @@ func (r *IronicReconciler) conductorDeploymentCreateOrUpdate(
 	conductorSpec ironicv1.IronicConductorTemplate,
 	keystoneEndpoints *ironicv1.KeystoneEndpoints,
 	keystoneRegion string,
+	transportURLSecretName string,
 ) (*ironicv1.IronicConductor, controllerutil.OperationResult, error) {
 	name := fmt.Sprintf("%s-%s", instance.Name, ironic.ConductorComponent)
 	if conductorSpec.ConductorGroup != "" {
@@ -911,7 +929,7 @@ func (r *IronicReconciler) conductorDeploymentCreateOrUpdate(
 		ServiceUser:             instance.Spec.ServiceUser,
 		DatabaseAccount:         instance.Spec.DatabaseAccount,
 		DatabaseHostname:        instance.Status.DatabaseHostname,
-		TransportURLSecret:      instance.Status.TransportURLSecret,
+		TransportURLSecret:      transportURLSecretName,
 		KeystoneEndpoints:       *keystoneEndpoints,
 		Region:                  keystoneRegion,
 		TLS:                     instance.Spec.IronicAPI.TLS.Ca,
@@ -958,6 +976,7 @@ func (r *IronicReconciler) apiDeploymentCreateOrUpdate(
 	instance *ironicv1.Ironic,
 	keystoneEndpoints *ironicv1.KeystoneEndpoints,
 	keystoneRegion string,
+	transportURLSecretName string,
 ) (*ironicv1.IronicAPI, controllerutil.OperationResult, error) {
 	IronicAPISpec := ironicv1.IronicAPISpec{
 		IronicAPITemplate:  instance.Spec.IronicAPI,
@@ -969,7 +988,7 @@ func (r *IronicReconciler) apiDeploymentCreateOrUpdate(
 		ServiceUser:        instance.Spec.ServiceUser,
 		DatabaseAccount:    instance.Spec.DatabaseAccount,
 		DatabaseHostname:   instance.Status.DatabaseHostname,
-		TransportURLSecret: instance.Status.TransportURLSecret,
+		TransportURLSecret: transportURLSecretName,
 		KeystoneEndpoints:  *keystoneEndpoints,
 		Region:             keystoneRegion,
 		Auth:               instance.Spec.Auth,
@@ -1023,6 +1042,7 @@ func (r *IronicReconciler) generateServiceConfigMaps(
 	keystoneEndpoints *ironicv1.KeystoneEndpoints,
 	keystoneRegion string,
 	db *mariadbv1.Database,
+	transportURLSecretName string,
 ) error {
 	Log := r.GetLogger(ctx)
 
@@ -1059,7 +1079,7 @@ func (r *IronicReconciler) generateServiceConfigMaps(
 	// Initialize ConductorGroup key to ensure template rendering does not fail
 	templateParameters["ConductorGroup"] = nil
 
-	transportURL, err := r.getTransportURL(ctx, h, instance)
+	transportURL, err := getTransportURLFromSecret(ctx, h, instance, transportURLSecretName)
 	if err != nil {
 		return err
 	}
@@ -1072,7 +1092,7 @@ func (r *IronicReconciler) generateServiceConfigMaps(
 
 	quorumQueues := false
 	if instance.Spec.RPCTransport == "oslo" {
-		quorumQueues, err = getQuorumQueues(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
+		quorumQueues, err = getQuorumQueues(ctx, h, transportURLSecretName, instance.Namespace)
 		if err != nil {
 			return err
 		}
@@ -1146,15 +1166,16 @@ func (r *IronicReconciler) generateServiceConfigMaps(
 	return oko_secret.EnsureSecrets(ctx, h, instance, cms, envVars)
 }
 
-func (r *IronicReconciler) getTransportURL(
+func getTransportURLFromSecret(
 	ctx context.Context,
 	h *helper.Helper,
 	instance *ironicv1.Ironic,
+	transportURLSecretName string,
 ) (string, error) {
 	if instance.Spec.RPCTransport != "oslo" {
 		return "fake://", nil
 	}
-	transportURLSecret, _, err := oko_secret.GetSecret(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
+	transportURLSecret, _, err := oko_secret.GetSecret(ctx, h, transportURLSecretName, instance.Namespace)
 	if err != nil {
 		return "", err
 	}
@@ -1470,88 +1491,4 @@ func (r *IronicReconciler) ensureDB(
 	instance.Status.DatabaseHostname = db.GetDatabaseHostname()
 	instance.Status.Conditions.MarkTrue(condition.DBReadyCondition, condition.DBReadyMessage)
 	return db, ctrlResult, nil
-}
-
-// checkIronicAPIGeneration -
-func (r *IronicReconciler) checkIronicAPIGeneration(
-	instance *ironicv1.Ironic,
-) (bool, error) {
-	Log := r.GetLogger(context.Background())
-	api := &ironicv1.IronicAPIList{}
-	listOpts := []client.ListOption{
-		client.InNamespace(instance.Namespace),
-	}
-	if err := r.List(context.Background(), api, listOpts...); err != nil {
-		Log.Error(err, "Unable to retrieve IronicAPI CR %w")
-		return false, err
-	}
-	for _, item := range api.Items {
-		if item.Generation != item.Status.ObservedGeneration {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-// checkIronicConductorGeneration -
-func (r *IronicReconciler) checkIronicConductorGeneration(
-	instance *ironicv1.Ironic,
-) (bool, error) {
-	Log := r.GetLogger(context.Background())
-	cnd := &ironicv1.IronicConductorList{}
-	listOpts := []client.ListOption{
-		client.InNamespace(instance.Namespace),
-	}
-	if err := r.List(context.Background(), cnd, listOpts...); err != nil {
-		Log.Error(err, "Unable to retrieve IronicConductor CR %w")
-		return false, err
-	}
-	for _, item := range cnd.Items {
-		if item.Generation != item.Status.ObservedGeneration {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-// checkIronicInspectorGeneration -
-func (r *IronicReconciler) checkIronicInspectorGeneration(
-	instance *ironicv1.Ironic,
-) (bool, error) {
-	Log := r.GetLogger(context.Background())
-	nsp := &ironicv1.IronicInspectorList{}
-	listOpts := []client.ListOption{
-		client.InNamespace(instance.Namespace),
-	}
-	if err := r.List(context.Background(), nsp, listOpts...); err != nil {
-		Log.Error(err, "Unable to retrieve IronicInspector CR %w")
-		return false, err
-	}
-	for _, item := range nsp.Items {
-		if item.Generation != item.Status.ObservedGeneration {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-// checkNeutronAgentGeneration -
-func (r *IronicReconciler) checkNeutronAgentGeneration(
-	instance *ironicv1.Ironic,
-) (bool, error) {
-	Log := r.GetLogger(context.Background())
-	ag := &ironicv1.IronicNeutronAgentList{}
-	listOpts := []client.ListOption{
-		client.InNamespace(instance.Namespace),
-	}
-	if err := r.List(context.Background(), ag, listOpts...); err != nil {
-		Log.Error(err, "Unable to retrieve IronicNeutronAgent CR %w")
-		return false, err
-	}
-	for _, item := range ag.Items {
-		if item.Generation != item.Status.ObservedGeneration {
-			return false, nil
-		}
-	}
-	return true, nil
 }

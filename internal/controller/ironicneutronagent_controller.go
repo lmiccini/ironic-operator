@@ -713,6 +713,12 @@ func (r *IronicNeutronAgentReconciler) reconcileDeployment(
 				condition.SeverityInfo,
 				condition.DeploymentReadyRunningMessage))
 		}
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.DeploymentReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	return ctrl.Result{}, nil

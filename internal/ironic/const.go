@@ -53,4 +53,8 @@ const (
 
 	// InspectorACConsumerFinalizer is added to AC secrets that ironic-inspector is actively consuming
 	InspectorACConsumerFinalizer = "openstack.org/ironic-inspector-ac-consumer"
+
+	// TransportConsumerFinalizer is added to transport secrets that ironic is
+	// actively consuming, preventing premature deletion during credential rotation
+	TransportConsumerFinalizer = "openstack.org/ironic-transport-consumer"
 )

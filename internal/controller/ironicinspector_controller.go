@@ -477,11 +477,12 @@ func (r *IronicInspectorReconciler) getTransportURL(
 	ctx context.Context,
 	h *helper.Helper,
 	instance *ironicv1.IronicInspector,
+	transportURLSecretName string,
 ) (string, error) {
 	if instance.Spec.RPCTransport != "oslo" {
 		return "fake://", nil
 	}
-	transportURLSecret, _, err := oko_secret.GetSecret(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
+	transportURLSecret, _, err := oko_secret.GetSecret(ctx, h, transportURLSecretName, instance.Namespace)
 	if err != nil {
 		return "", err
 	}
@@ -523,8 +524,8 @@ func (r *IronicInspectorReconciler) transportURLCreateOrUpdate(
 func (r *IronicInspectorReconciler) reconcileTransportURL(
 	ctx context.Context,
 	instance *ironicv1.IronicInspector,
-	_ *helper.Helper,
-) (ctrl.Result, error) {
+	h *helper.Helper,
+) (string, ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
 	if instance.Spec.RPCTransport == "oslo" {
@@ -545,7 +546,7 @@ func (r *IronicInspectorReconciler) reconcileTransportURL(
 				condition.RabbitMqTransportURLReadyErrorMessage,
 				err.Error(),
 			))
-			return ctrl.Result{}, err
+			return "", ctrl.Result{}, err
 		}
 
 		if op != controllerutil.OperationResultNone {
@@ -554,9 +555,20 @@ func (r *IronicInspectorReconciler) reconcileTransportURL(
 				transportURL.Name, string(op)))
 		}
 
-		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+		if err := rabbitmqv1.ManageTransportSecretFinalizer(
+			ctx, h, instance.Namespace,
+			transportURL.Status.SecretName,
+			ironic.TransportConsumerFinalizer,
+		); err != nil {
+			return "", ctrl.Result{}, err
+		}
 
-		if instance.Status.TransportURLSecret == "" {
+		if instance.Status.TransportURLSecret == "" ||
+			instance.Status.TransportURLSecret == transportURL.Status.SecretName {
+			instance.Status.TransportURLSecret = transportURL.Status.SecretName
+		}
+
+		if transportURL.Status.SecretName == "" {
 			Log.Info(fmt.Sprintf(
 				"Waiting for TransportURL %s secret to be created",
 				transportURL.Name))
@@ -565,7 +577,7 @@ func (r *IronicInspectorReconciler) reconcileTransportURL(
 				condition.RequestedReason,
 				condition.SeverityInfo,
 				condition.RabbitMqTransportURLReadyRunningMessage))
-			return ctrl.Result{}, nil
+			return "", ctrl.Result{}, nil
 		}
 
 		instance.Status.Conditions.MarkTrue(
@@ -586,18 +598,31 @@ func (r *IronicInspectorReconciler) reconcileTransportURL(
 			Log,
 		)
 		if err != nil || result.Requeue || result.RequeueAfter > 0 {
-			return result, err
+			return "", result, err
 		}
-	} else {
-		instance.Status.TransportURLSecret = ""
-		instance.Status.NotificationsURLSecret = nil
-		instance.Status.Conditions.MarkTrue(
-			condition.RabbitMqTransportURLReadyCondition,
-			ironicv1.RabbitMqTransportURLDisabledMessage)
+		newNotifSecret := ""
+		if instance.Status.NotificationsURLSecret != nil {
+			newNotifSecret = *instance.Status.NotificationsURLSecret
+		}
+		if err := rabbitmqv1.ManageTransportSecretFinalizer(
+			ctx, h, instance.Namespace,
+			newNotifSecret,
+			ironic.TransportConsumerFinalizer,
+		); err != nil {
+			return "", ctrl.Result{}, err
+		}
+
+		return transportURL.Status.SecretName, ctrl.Result{}, nil
 	}
+
+	instance.Status.TransportURLSecret = ""
+	instance.Status.NotificationsURLSecret = nil
+	instance.Status.Conditions.MarkTrue(
+		condition.RabbitMqTransportURLReadyCondition,
+		ironicv1.RabbitMqTransportURLDisabledMessage)
 	// transportURL - end
 
-	return ctrl.Result{}, nil
+	return "", ctrl.Result{}, nil
 }
 
 func (r *IronicInspectorReconciler) reconcileConfigMapsAndSecrets(
@@ -605,6 +630,7 @@ func (r *IronicInspectorReconciler) reconcileConfigMapsAndSecrets(
 	instance *ironicv1.IronicInspector,
 	helper *helper.Helper,
 	db *mariadbv1.Database,
+	transportURLSecretName string,
 ) (ctrl.Result, string, error) {
 	Log := r.GetLogger(ctx)
 	// ConfigMap
@@ -650,7 +676,7 @@ func (r *IronicInspectorReconciler) reconcileConfigMapsAndSecrets(
 	configMapVars[instance.Spec.Secret] = env.SetValue(hash)
 
 	// check for required TransportURL secret and add hash to the vars map
-	if instance.Status.TransportURLSecret != "" {
+	if transportURLSecretName != "" {
 		// transportURLFields are not pure password fields. We do not associate a
 		// password validator and we only verify that the entry exists in the
 		// secret
@@ -661,7 +687,7 @@ func (r *IronicInspectorReconciler) reconcileConfigMapsAndSecrets(
 			ctx,
 			types.NamespacedName{
 				Namespace: instance.Namespace,
-				Name:      instance.Status.TransportURLSecret,
+				Name:      transportURLSecretName,
 			},
 			transportValidateFields,
 			helper.GetClient(),
@@ -676,7 +702,7 @@ func (r *IronicInspectorReconciler) reconcileConfigMapsAndSecrets(
 				err.Error()))
 			return ctrlResult, "", err
 		} else if (ctrlResult != ctrl.Result{}) {
-			Log.Info(fmt.Sprintf("TransportURL secret %s not found", instance.Status.TransportURLSecret))
+			Log.Info(fmt.Sprintf("TransportURL secret %s not found", transportURLSecretName))
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.InputReadyCondition,
 				condition.RequestedReason,
@@ -684,7 +710,7 @@ func (r *IronicInspectorReconciler) reconcileConfigMapsAndSecrets(
 				condition.InputReadyWaitingMessage))
 			return ctrlResult, "", err
 		}
-		configMapVars[instance.Status.TransportURLSecret] = env.SetValue(hash)
+		configMapVars[transportURLSecretName] = env.SetValue(hash)
 	}
 
 	instance.Status.Conditions.MarkTrue(
@@ -766,7 +792,8 @@ func (r *IronicInspectorReconciler) reconcileConfigMapsAndSecrets(
 		instance,
 		helper,
 		&configMapVars,
-		db)
+		db,
+		transportURLSecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -914,6 +941,12 @@ func (r *IronicInspectorReconciler) reconcileStatefulSet(
 
 			return ctrl.Result{RequeueAfter: time.Second * 10}, nil
 		}
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.DeploymentReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 	// create Statefulset - end
 
@@ -958,7 +991,7 @@ func (r *IronicInspectorReconciler) reconcileNormal(
 		}
 	}
 
-	ctrlResult, err := r.reconcileTransportURL(ctx, instance, helper)
+	newTransportURLSecret, ctrlResult, err := r.reconcileTransportURL(ctx, instance, helper)
 	if err != nil {
 		return ctrlResult, err
 	} else if (ctrlResult != ctrl.Result{}) {
@@ -972,7 +1005,7 @@ func (r *IronicInspectorReconciler) reconcileNormal(
 		return ctrlResult, nil
 	}
 
-	ctrlResult, inputHash, err := r.reconcileConfigMapsAndSecrets(ctx, instance, helper, db)
+	ctrlResult, inputHash, err := r.reconcileConfigMapsAndSecrets(ctx, instance, helper, db, newTransportURLSecret)
 	if err != nil {
 		return ctrlResult, err
 	} else if (ctrlResult != ctrl.Result{}) {
@@ -1045,6 +1078,23 @@ func (r *IronicInspectorReconciler) reconcileNormal(
 	err = mariadbv1.DeleteUnusedMariaDBAccountFinalizers(ctx, helper, ironicinspector.DatabaseCRName, instance.Spec.DatabaseAccount, instance.Namespace)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	isTransportRotation := instance.Status.TransportURLSecret != "" &&
+		instance.Status.TransportURLSecret != newTransportURLSecret
+	if isTransportRotation {
+		if instance.Status.Conditions.AllSubConditionIsTrue() {
+			if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+				ctx, helper, instance.Namespace,
+				instance.Status.TransportURLSecret,
+				ironic.TransportConsumerFinalizer,
+			); err != nil {
+				return ctrl.Result{}, err
+			}
+			instance.Status.TransportURLSecret = newTransportURLSecret
+		}
+	} else {
+		instance.Status.TransportURLSecret = newTransportURLSecret
 	}
 
 	// We reached the end of the Reconcile, update the Ready condition based on
@@ -1149,6 +1199,23 @@ func (r *IronicInspectorReconciler) reconcileDelete(
 	); err != nil {
 		return ctrlResult, err
 	}
+	if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		ironic.TransportConsumerFinalizer,
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+	if instance.Status.NotificationsURLSecret != nil {
+		if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+			ctx, helper, instance.Namespace,
+			*instance.Status.NotificationsURLSecret,
+			ironic.TransportConsumerFinalizer,
+		); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Service is deleted so remove the finalizer.
 	controllerutil.RemoveFinalizer(instance, helper.GetFinalizer())
 	Log.Info("Reconciled Ironic Inspector delete successfully")
@@ -1504,6 +1571,7 @@ func (r *IronicInspectorReconciler) generateServiceSecrets(
 	h *helper.Helper,
 	envVars *map[string]env.Setter,
 	db *mariadbv1.Database,
+	transportURLSecretName string,
 ) error {
 	// Create/update secrets from templates
 	cmLabels := labels.GetLabels(
@@ -1525,7 +1593,7 @@ func (r *IronicInspectorReconciler) generateServiceSecrets(
 	maps.Copy(customData, instance.Spec.DefaultConfigOverwrite)
 	templateParameters := make(map[string]any)
 
-	transportURL, err := r.getTransportURL(ctx, h, instance)
+	transportURL, err := r.getTransportURL(ctx, h, instance, transportURLSecretName)
 	if err != nil {
 		return err
 	}
@@ -1538,7 +1606,7 @@ func (r *IronicInspectorReconciler) generateServiceSecrets(
 
 	quorumQueues := false
 	if instance.Spec.RPCTransport == "oslo" {
-		quorumQueues, err = getQuorumQueues(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
+		quorumQueues, err = getQuorumQueues(ctx, h, transportURLSecretName, instance.Namespace)
 		if err != nil {
 			return err
 		}

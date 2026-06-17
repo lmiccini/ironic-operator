@@ -1841,6 +1841,155 @@ var _ = Describe("Ironic controller", func() {
 		})
 	})
 
+	When("TransportURL consumer finalizer is managed", func() {
+		BeforeEach(func() {
+			DeferCleanup(
+				k8sClient.Delete,
+				ctx,
+				CreateIronicSecret(ironicNames.Namespace, SecretName),
+			)
+			DeferCleanup(
+				k8sClient.Delete,
+				ctx,
+				infra.CreateTransportURLSecret(ironicNames.Namespace, MessageBusSecretName, false),
+			)
+			DeferCleanup(
+				mariadb.DeleteDBService,
+				mariadb.CreateDBService(
+					ironicNames.Namespace,
+					"openstack",
+					corev1.ServiceSpec{
+						Ports: []corev1.ServicePort{{Port: 3306}},
+					},
+				),
+			)
+			DeferCleanup(
+				keystone.DeleteKeystoneAPI,
+				keystone.CreateKeystoneAPI(ironicNames.Namespace))
+
+			spec := GetDefaultIronicSpec()
+			spec["rpcTransport"] = "oslo"
+			spec["transportURLSecret"] = MessageBusSecretName
+			DeferCleanup(
+				th.DeleteInstance,
+				CreateIronic(ironicNames.IronicName, spec),
+			)
+
+			infra.SimulateTransportURLReady(ironicNames.IronicTransportURLName)
+			mariadb.GetMariaDBDatabase(ironicNames.IronicDatabaseName)
+			mariadb.SimulateMariaDBAccountCompleted(ironicNames.IronicDatabaseAccount)
+			mariadb.SimulateMariaDBDatabaseCompleted(ironicNames.IronicDatabaseName)
+		})
+
+		It("should add the consumer finalizer to the transport secret", func() {
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: ironicNames.Namespace,
+					Name:      MessageBusSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(ironic.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should remove the consumer finalizer from transport secret on CR deletion", func() {
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: ironicNames.Namespace,
+					Name:      MessageBusSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(ironic.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			th.DeleteInstance(GetIronic(ironicNames.IronicName))
+
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: ironicNames.Namespace,
+					Name:      MessageBusSecretName,
+				})
+				g.Expect(secret.Finalizers).NotTo(
+					ContainElement(ironic.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should move the finalizer from the old to the new secret on transport rotation", func() {
+			oldSecretName := MessageBusSecretName
+
+			// Wait for the consumer finalizer to be added to the old secret
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: ironicNames.Namespace,
+					Name:      oldSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(ironic.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			simulateIronicSubServicesReady(ironicNames)
+			Eventually(func(g Gomega) {
+				i := GetIronic(ironicNames.IronicName)
+				g.Expect(i.Status.Conditions.IsTrue(condition.ReadyCondition)).To(BeTrue())
+				g.Expect(i.Status.TransportURLSecret).To(Equal(oldSecretName))
+			}, timeout, interval).Should(Succeed())
+
+			newSecretName := "rabbitmq-secret-rotated"
+			newSecret := th.CreateSecret(
+				types.NamespacedName{
+					Namespace: ironicNames.Namespace,
+					Name:      newSecretName,
+				},
+				map[string][]byte{
+					"transport_url": []byte("rabbit://rotated-user:rotated-pass@rabbitmq/fake"),
+				},
+			)
+			DeferCleanup(k8sClient.Delete, ctx, newSecret)
+
+			Eventually(func(g Gomega) {
+				transport := infra.GetTransportURL(ironicNames.IronicTransportURLName)
+				transport.Status.SecretName = newSecretName
+				g.Expect(k8sClient.Status().Update(ctx, transport)).To(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: ironicNames.Namespace,
+					Name:      newSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(ironic.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			Consistently(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: ironicNames.Namespace,
+					Name:      oldSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(ironic.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				th.SimulateDeploymentReplicaReady(ironicNames.IronicName)
+				th.SimulateStatefulSetReplicaReady(ironicNames.ConductorName)
+				th.SimulateStatefulSetReplicaReady(ironicNames.InspectorName)
+				th.SimulateDeploymentReplicaReady(ironicNames.INAName)
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: ironicNames.Namespace,
+					Name:      oldSecretName,
+				})
+				g.Expect(secret.Finalizers).NotTo(
+					ContainElement(ironic.TransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				i := GetIronic(ironicNames.IronicName)
+				g.Expect(i.Status.TransportURLSecret).To(Equal(newSecretName))
+			}, timeout, interval).Should(Succeed())
+		})
+	})
+
 })
 
 var _ = Describe("Ironic Webhook", func() {

@@ -1006,6 +1006,12 @@ func (r *IronicAPIReconciler) reconcileNormal(ctx context.Context, instance *iro
 				condition.SeverityInfo,
 				condition.DeploymentReadyRunningMessage))
 		}
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.DeploymentReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 	// create Deployment - end
 

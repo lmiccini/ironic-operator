@@ -862,6 +862,12 @@ func (r *IronicConductorReconciler) reconcileNormal(ctx context.Context, instanc
 				condition.SeverityInfo,
 				condition.DeploymentReadyRunningMessage))
 		}
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.DeploymentReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	// We reached the end of the Reconcile, update the Ready condition based on
