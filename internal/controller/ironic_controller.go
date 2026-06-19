@@ -613,6 +613,8 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 	// normal reconcile tasks
 	//
 
+	allSubCRsStable := true
+
 	// deploy ironic-conductors
 	for _, conductorSpec := range instance.Spec.IronicConductors {
 
@@ -645,6 +647,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 				instance.Status.Conditions.Set(c)
 			}
 			if op != controllerutil.OperationResultNone {
+				allSubCRsStable = false
 				Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicConductor.Name, string(op)))
 			}
 		} else {
@@ -678,6 +681,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			instance.Status.Conditions.Set(c)
 		}
 		if op != controllerutil.OperationResultNone {
+			allSubCRsStable = false
 			Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicAPI.Name, string(op)))
 		}
 	} else {
@@ -712,6 +716,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 				instance.Status.Conditions.Set(c)
 			}
 			if op != controllerutil.OperationResultNone {
+				allSubCRsStable = false
 				Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicInspector.Name, string(op)))
 			}
 		} else {
@@ -758,6 +763,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 				instance.Status.Conditions.Set(c)
 			}
 			if op != controllerutil.OperationResultNone {
+				allSubCRsStable = false
 				Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicNeutronAgent.Name, string(op)))
 			}
 		} else {
@@ -818,26 +824,18 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 		instance.Status.InspectorApplicationCredentialSecret = instance.Spec.IronicInspector.Auth.ApplicationCredentialSecret
 	}
 
-	// Late phase of the transport secret split pattern: remove the old
-	// transport secret's finalizer and update status only after all
-	// sub-services are ready with the new secret.
 	if mainTransportURL != nil {
-		isTransportRotation := instance.Status.TransportURLSecret != "" &&
-			instance.Status.TransportURLSecret != mainTransportURL.Status.SecretName
-		if isTransportRotation {
-			if instance.Status.Conditions.AllSubConditionIsTrue() {
-				if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
-					ctx, helper, instance.Namespace,
-					instance.Status.TransportURLSecret,
-					ironic.TransportConsumerFinalizer,
-				); err != nil {
-					return ctrl.Result{}, err
-				}
-				instance.Status.TransportURLSecret = mainTransportURL.Status.SecretName
-			}
-		} else {
-			instance.Status.TransportURLSecret = mainTransportURL.Status.SecretName
+		secretName, err := rabbitmqv1.FinalizeTransportSecretRotation(
+			ctx, helper, instance.Namespace,
+			instance.Status.TransportURLSecret,
+			mainTransportURL.Status.SecretName,
+			ironic.TransportConsumerFinalizer,
+			allSubCRsStable && instance.Status.Conditions.AllSubConditionIsTrue(),
+		)
+		if err != nil {
+			return ctrl.Result{}, err
 		}
+		instance.Status.TransportURLSecret = secretName
 	}
 
 	// We reached the end of the Reconcile, update the Ready condition based on

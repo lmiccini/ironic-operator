@@ -1080,22 +1080,17 @@ func (r *IronicInspectorReconciler) reconcileNormal(
 		return ctrl.Result{}, err
 	}
 
-	isTransportRotation := instance.Status.TransportURLSecret != "" &&
-		instance.Status.TransportURLSecret != newTransportURLSecret
-	if isTransportRotation {
-		if instance.Status.Conditions.AllSubConditionIsTrue() {
-			if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
-				ctx, helper, instance.Namespace,
-				instance.Status.TransportURLSecret,
-				ironic.TransportConsumerFinalizer,
-			); err != nil {
-				return ctrl.Result{}, err
-			}
-			instance.Status.TransportURLSecret = newTransportURLSecret
-		}
-	} else {
-		instance.Status.TransportURLSecret = newTransportURLSecret
+	secretName, err := rabbitmqv1.FinalizeTransportSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		newTransportURLSecret,
+		ironic.TransportConsumerFinalizer,
+		instance.Status.Conditions.AllSubConditionIsTrue(),
+	)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
+	instance.Status.TransportURLSecret = secretName
 
 	// We reached the end of the Reconcile, update the Ready condition based on
 	// the sub conditions
