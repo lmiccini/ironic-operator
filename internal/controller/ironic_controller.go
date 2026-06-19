@@ -616,6 +616,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 	allSubCRsStable := true
 
 	// deploy ironic-conductors
+	waitingConductorGenerationMatch := false
 	for _, conductorSpec := range instance.Spec.IronicConductors {
 
 		ironicConductor, op, err := r.conductorDeploymentCreateOrUpdate(
@@ -651,12 +652,15 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 				Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicConductor.Name, string(op)))
 			}
 		} else {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				ironicv1.IronicConductorReadyCondition,
-				condition.RequestedReason,
-				condition.SeverityInfo,
-				condition.DeploymentReadyRunningMessage))
+			waitingConductorGenerationMatch = true
 		}
+	}
+	if waitingConductorGenerationMatch {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			ironicv1.IronicConductorReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	// deploy ironic-api
@@ -796,10 +800,12 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 	// Late phase of the AC split pattern: remove the old AC secret's finalizer
 	// and update status only after all sub-services are ready with the new
 	// credentials. This prevents premature revocation during rapid rotations.
+	guardReady := allSubCRsStable && instance.Status.Conditions.AllSubConditionIsTrue()
+
 	isIronicRotation := instance.Status.ApplicationCredentialSecret != "" &&
 		instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret
 	if isIronicRotation {
-		if instance.Status.Conditions.AllSubConditionIsTrue() {
+		if guardReady {
 			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 				instance.Status.ApplicationCredentialSecret, ironic.ACConsumerFinalizer); err != nil {
 				return ctrl.Result{}, err
@@ -813,7 +819,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 	isInspectorRotation := instance.Status.InspectorApplicationCredentialSecret != "" &&
 		instance.Status.InspectorApplicationCredentialSecret != instance.Spec.IronicInspector.Auth.ApplicationCredentialSecret
 	if isInspectorRotation {
-		if instance.Status.Conditions.AllSubConditionIsTrue() {
+		if guardReady {
 			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 				instance.Status.InspectorApplicationCredentialSecret, ironic.InspectorACConsumerFinalizer); err != nil {
 				return ctrl.Result{}, err
@@ -830,7 +836,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			instance.Status.TransportURLSecret,
 			mainTransportURL.Status.SecretName,
 			ironic.TransportConsumerFinalizer,
-			allSubCRsStable && instance.Status.Conditions.AllSubConditionIsTrue(),
+			guardReady,
 		)
 		if err != nil {
 			return ctrl.Result{}, err
