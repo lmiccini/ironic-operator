@@ -44,6 +44,7 @@ import (
 	"github.com/go-logr/logr"
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	ironicv1 "github.com/openstack-k8s-operators/ironic-operator/api/v1beta1"
+	ironic "github.com/openstack-k8s-operators/ironic-operator/internal/ironic"
 	"github.com/openstack-k8s-operators/ironic-operator/internal/ironicneutronagent"
 	keystonev1 "github.com/openstack-k8s-operators/keystone-operator/api/v1beta1"
 	endpoint "github.com/openstack-k8s-operators/lib-common/modules/common/endpoint"
@@ -56,6 +57,7 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/env"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
@@ -64,8 +66,9 @@ import (
 // IronicNeutronAgentReconciler reconciles a IronicNeutronAgent object
 type IronicNeutronAgentReconciler struct {
 	client.Client
-	Kclient kubernetes.Interface
-	Scheme  *runtime.Scheme
+	Kclient   kubernetes.Interface
+	Scheme    *runtime.Scheme
+	APIReader client.Reader
 }
 
 // GetLogger returns a logger object with a prefix of "controller.name" and additional controller context fields
@@ -124,6 +127,7 @@ func (r *IronicNeutronAgentReconciler) Reconcile(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	helper.SetAPIReader(r.APIReader)
 
 	// initialize status if Conditions is nil, but do not reset if it already
 	// exists
@@ -367,9 +371,10 @@ func (r *IronicNeutronAgentReconciler) findObjectForSrc(ctx context.Context, src
 func (r *IronicNeutronAgentReconciler) getTransportURL(
 	ctx context.Context,
 	h *helper.Helper,
+	transportURLSecretName string,
 	instance *ironicv1.IronicNeutronAgent,
 ) (string, error) {
-	transportURLSecret, _, err := secret.GetSecret(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
+	transportURLSecret, _, err := secret.GetSecret(ctx, h, transportURLSecretName, instance.Namespace)
 	if err != nil {
 		return "", err
 	}
@@ -411,8 +416,8 @@ func (r *IronicNeutronAgentReconciler) transportURLCreateOrUpdate(
 func (r *IronicNeutronAgentReconciler) reconcileTransportURL(
 	ctx context.Context,
 	instance *ironicv1.IronicNeutronAgent,
-	_ *helper.Helper,
-) (ctrl.Result, error) {
+	h *helper.Helper,
+) (string, ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
 	//
@@ -432,15 +437,15 @@ func (r *IronicNeutronAgentReconciler) reconcileTransportURL(
 			condition.RabbitMqTransportURLReadyErrorMessage,
 			err.Error(),
 		))
-		return ctrl.Result{}, err
+		return "", ctrl.Result{}, err
 	}
 	if op != controllerutil.OperationResultNone {
 		Log.Info(fmt.Sprintf(
 			"TransportURL %s successfully reconciled - operation: %s",
 			transportURL.Name, string(op)))
 	}
-	instance.Status.TransportURLSecret = transportURL.Status.SecretName
-	if instance.Status.TransportURLSecret == "" {
+
+	if transportURL.Status.SecretName == "" {
 		Log.Info(fmt.Sprintf(
 			"Waiting for TransportURL %s secret to be created",
 			transportURL.Name))
@@ -449,8 +454,22 @@ func (r *IronicNeutronAgentReconciler) reconcileTransportURL(
 			condition.RequestedReason,
 			condition.SeverityInfo,
 			condition.RabbitMqTransportURLReadyRunningMessage))
-		return ctrl.Result{}, nil
+		return "", ctrl.Result{}, nil
 	}
+
+	if err := object.ManageSecretConsumerFinalizer(
+		ctx, h, instance.Namespace,
+		transportURL.Status.SecretName,
+		ironic.NeutronAgentTransportConsumerFinalizer,
+	); err != nil {
+		return "", ctrl.Result{}, err
+	}
+
+	if instance.Status.TransportURLSecret == "" ||
+		instance.Status.TransportURLSecret == transportURL.Status.SecretName {
+		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	}
+
 	instance.Status.Conditions.MarkTrue(
 		condition.RabbitMqTransportURLReadyCondition,
 		condition.RabbitMqTransportURLReadyMessage)
@@ -458,7 +477,7 @@ func (r *IronicNeutronAgentReconciler) reconcileTransportURL(
 	//
 	// Create notifications TransportURL if configured
 	//
-	return ensureNotificationsTransportURL(
+	result, err := ensureNotificationsTransportURL(
 		ctx,
 		instance.Spec.NotificationsBus,
 		&instance.Status.NotificationsURLSecret,
@@ -468,6 +487,24 @@ func (r *IronicNeutronAgentReconciler) reconcileTransportURL(
 		&instance.Status.Conditions,
 		Log,
 	)
+	if err != nil || result.Requeue || result.RequeueAfter > 0 {
+		return "", result, err
+	}
+	newNotifSecret := ""
+	if instance.Status.NotificationsURLSecret != nil {
+		newNotifSecret = *instance.Status.NotificationsURLSecret
+	}
+	if newNotifSecret != "" {
+		if err := object.ManageSecretConsumerFinalizer(
+			ctx, h, instance.Namespace,
+			newNotifSecret,
+			ironic.NeutronAgentTransportConsumerFinalizer,
+		); err != nil {
+			return "", ctrl.Result{}, err
+		}
+	}
+
+	return transportURL.Status.SecretName, ctrl.Result{}, nil
 }
 
 func (r *IronicNeutronAgentReconciler) reconcileConfigMapsAndSecrets(
@@ -646,7 +683,7 @@ func (r *IronicNeutronAgentReconciler) reconcileDeployment(
 	helper *helper.Helper,
 	inputHash string,
 	serviceLabels map[string]string,
-) (ctrl.Result, error) {
+) (ctrl.Result, bool, error) {
 
 	//
 	// Handle Topology
@@ -666,7 +703,7 @@ func (r *IronicNeutronAgentReconciler) reconcileDeployment(
 			condition.SeverityWarning,
 			condition.TopologyReadyErrorMessage,
 			err.Error()))
-		return ctrl.Result{}, fmt.Errorf("waiting for Topology requirements: %w", err)
+		return ctrl.Result{}, false, fmt.Errorf("waiting for Topology requirements: %w", err)
 	}
 
 	// Define a new Deployment object
@@ -685,27 +722,24 @@ func (r *IronicNeutronAgentReconciler) reconcileDeployment(
 			condition.SeverityWarning,
 			condition.DeploymentReadyErrorMessage,
 			err.Error()))
-		return ctrlResult, err
+		return ctrlResult, false, err
 	} else if (ctrlResult != ctrl.Result{}) {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.DeploymentReadyCondition,
 			condition.RequestedReason,
 			condition.SeverityInfo,
 			condition.DeploymentReadyRunningMessage))
-		return ctrlResult, nil
+		return ctrlResult, false, nil
 	}
 
-	// Only check ReadyCount if controller sees the last version of the CR
 	deploy := depl.GetDeployment()
+	ready := false
 	if deploy.Generation == deploy.Status.ObservedGeneration {
 		instance.Status.ReadyCount = deploy.Status.ReadyReplicas
 
-		// Mark the Deployment as Ready only if the number of Replicas is equals
-		// to the Deployed instances (ReadyCount), and the the Status.Replicas
-		// match Status.ReadyReplicas. If a deployment update is in progress,
-		// Replicas > ReadyReplicas.
 		if deployment.IsReady(deploy) {
 			instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
+			ready = true
 		} else {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.DeploymentReadyCondition,
@@ -715,7 +749,7 @@ func (r *IronicNeutronAgentReconciler) reconcileDeployment(
 		}
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, ready, nil
 }
 
 func (r *IronicNeutronAgentReconciler) reconcileNormal(
@@ -750,7 +784,7 @@ func (r *IronicNeutronAgentReconciler) reconcileNormal(
 		}
 	}
 
-	ctrlResult, err := r.reconcileTransportURL(ctx, instance, helper)
+	newTransportURLSecret, ctrlResult, err := r.reconcileTransportURL(ctx, instance, helper)
 	if err != nil {
 		return ctrlResult, err
 	} else if (ctrlResult != ctrl.Result{}) {
@@ -780,12 +814,35 @@ func (r *IronicNeutronAgentReconciler) reconcileNormal(
 	//
 	// normal reconcile tasks
 	//
-	ctrlResult, err = r.reconcileDeployment(ctx, instance, helper, inputHash, serviceLabels)
+	ctrlResult, deploymentReady, err := r.reconcileDeployment(ctx, instance, helper, inputHash, serviceLabels)
 	if err != nil {
 		return ctrlResult, err
 	} else if (ctrlResult != ctrl.Result{}) {
 		return ctrlResult, nil
 	}
+
+	// For leaf controllers, use deploymentReady as the stability check.
+	// When the Deployment isn't fully ready (just updated or rolling),
+	// requeue instead of evaluating the guard with stale conditions.
+	rotationPending := instance.Status.TransportURLSecret != "" &&
+		instance.Status.TransportURLSecret != newTransportURLSecret
+	if rotationPending && !deploymentReady {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	guardReady := condition.CredentialRotationGuardReady(true, &instance.Status.Conditions)
+
+	transportSecretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		newTransportURLSecret,
+		ironic.NeutronAgentTransportConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	instance.Status.TransportURLSecret = transportSecretName
 
 	// We reached the end of the Reconcile, update the Ready condition based on
 	// the sub conditions
@@ -825,6 +882,24 @@ func (r *IronicNeutronAgentReconciler) reconcileDelete(
 		return ctrlResult, err
 	}
 	Log.Info("Reconciling IronicNeutronAgent delete")
+
+	if err := object.RemoveSecretConsumerFinalizer(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		ironic.NeutronAgentTransportConsumerFinalizer,
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+	if instance.Status.NotificationsURLSecret != nil {
+		if err := object.RemoveSecretConsumerFinalizer(
+			ctx, helper, instance.Namespace,
+			*instance.Status.NotificationsURLSecret,
+			ironic.NeutronAgentTransportConsumerFinalizer,
+		); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Service is deleted so remove the finalizer.
 	controllerutil.RemoveFinalizer(instance, helper.GetFinalizer())
 	Log.Info("Reconciled IronicNeutronAgent delete successfully")
@@ -865,7 +940,7 @@ func (r *IronicNeutronAgentReconciler) generateServiceSecrets(
 		return err
 	}
 
-	transportURL, err := r.getTransportURL(ctx, h, instance)
+	transportURL, err := r.getTransportURL(ctx, h, instance.Status.TransportURLSecret, instance)
 	if err != nil {
 		return err
 	}

@@ -250,9 +250,10 @@ func main() {
 	}
 
 	if err := (&controller.IronicReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Kclient: kclient,
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Kclient:   kclient,
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Ironic")
 		os.Exit(1)
@@ -274,17 +275,19 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.IronicInspectorReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Kclient: kclient,
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Kclient:   kclient,
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(context.Background(), mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "IronicInspector")
 		os.Exit(1)
 	}
 	if err := (&controller.IronicNeutronAgentReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Kclient: kclient,
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Kclient:   kclient,
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(context.Background(), mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "IronicNeutronAgent")
 		os.Exit(1)

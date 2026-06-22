@@ -21,6 +21,7 @@ import (
 	// "fmt"
 
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" //revive:disable:dot-imports
 	. "github.com/onsi/gomega"    //revive:disable:dot-imports
@@ -29,6 +30,7 @@ import (
 	. "github.com/openstack-k8s-operators/lib-common/modules/common/test/helpers"
 
 	ironicv1 "github.com/openstack-k8s-operators/ironic-operator/api/v1beta1"
+	ironic "github.com/openstack-k8s-operators/ironic-operator/internal/ironic"
 	keystonev1 "github.com/openstack-k8s-operators/keystone-operator/api/v1beta1"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	corev1 "k8s.io/api/core/v1"
@@ -497,6 +499,93 @@ var _ = Describe("IronicNeutronAgent controller", func() {
 				g.Expect(conf).NotTo(ContainSubstring("username=ironic"))
 				g.Expect(conf).NotTo(ContainSubstring("project_name=service"))
 			}, timeout, interval).Should(Succeed())
+		})
+	})
+
+	When("TransportURL consumer finalizer is managed for IronicNeutronAgent", func() {
+		BeforeEach(func() {
+			DeferCleanup(
+				k8sClient.Delete,
+				ctx,
+				CreateIronicSecret(ironicNames.Namespace, SecretName),
+			)
+			DeferCleanup(
+				k8sClient.Delete,
+				ctx,
+				CreateMessageBusSecret(ironicNames.Namespace, MessageBusSecretName),
+			)
+			DeferCleanup(keystone.DeleteKeystoneAPI, keystone.CreateKeystoneAPI(ironicNames.Namespace))
+			DeferCleanup(th.DeleteInstance, CreateIronicNeutronAgent(ironicNames.INAName, GetDefaultIronicNeutronAgentSpec()))
+			infra.GetTransportURL(ironicNames.INATransportURLName)
+			infra.SimulateTransportURLReady(ironicNames.INATransportURLName)
+		})
+
+		It("should add the consumer finalizer to the transport secret", func() {
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: ironicNames.Namespace,
+					Name:      MessageBusSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(ironic.NeutronAgentTransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("should move the finalizer from old to new secret on transport rotation", func() {
+			oldSecretName := MessageBusSecretName
+			newSecretName := "rabbitmq-secret-rotated"
+
+			// Wait for INA to be fully ready
+			th.SimulateDeploymentReplicaReady(ironicNames.INAName)
+			Eventually(func(g Gomega) {
+				instance := GetIronicNeutronAgent(ironicNames.INAName)
+				g.Expect(instance.Status.Conditions.IsTrue(condition.ReadyCondition)).To(BeTrue())
+				g.Expect(instance.Status.TransportURLSecret).To(Equal(oldSecretName))
+			}, timeout, interval).Should(Succeed())
+
+			// Create the new rotated secret with DIFFERENT credentials
+			newSecret := th.CreateSecret(
+				types.NamespacedName{
+					Namespace: ironicNames.Namespace,
+					Name:      newSecretName,
+				},
+				map[string][]byte{
+					"transport_url": []byte("rabbit://rotated-user:rotated-pass@rabbitmq/fake"),
+				},
+			)
+			DeferCleanup(k8sClient.Delete, ctx, newSecret)
+
+			// Simulate transport rotation
+			Eventually(func(g Gomega) {
+				transport := infra.GetTransportURL(ironicNames.INATransportURLName)
+				transport.Status.SecretName = newSecretName
+				g.Expect(k8sClient.Status().Update(ctx, transport)).To(Succeed())
+			}, timeout, interval).Should(Succeed())
+
+			// Verify new secret gets the finalizer
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: ironicNames.Namespace,
+					Name:      newSecretName,
+				})
+				g.Expect(secret.Finalizers).To(
+					ContainElement(ironic.NeutronAgentTransportConsumerFinalizer))
+			}, timeout, interval).Should(Succeed())
+
+			// Simulate the Deployment as ready with new config
+			th.SimulateDeploymentReplicaReady(ironicNames.INAName)
+
+			// The old finalizer should be removed and status updated
+			Eventually(func(g Gomega) {
+				secret := th.GetSecret(types.NamespacedName{
+					Namespace: ironicNames.Namespace,
+					Name:      oldSecretName,
+				})
+				g.Expect(secret.Finalizers).NotTo(
+					ContainElement(ironic.NeutronAgentTransportConsumerFinalizer))
+				instance := GetIronicNeutronAgent(ironicNames.INAName)
+				g.Expect(instance.Status.TransportURLSecret).To(Equal(newSecretName))
+			}, 10*time.Second, interval).Should(Succeed())
 		})
 	})
 })

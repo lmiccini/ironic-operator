@@ -33,6 +33,7 @@ import (
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	job "github.com/openstack-k8s-operators/lib-common/modules/common/job"
 	labels "github.com/openstack-k8s-operators/lib-common/modules/common/labels"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
 	oko_secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
@@ -64,8 +65,9 @@ import (
 // IronicReconciler reconciles a Ironic object
 type IronicReconciler struct {
 	client.Client
-	Kclient kubernetes.Interface
-	Scheme  *runtime.Scheme
+	Kclient   kubernetes.Interface
+	Scheme    *runtime.Scheme
+	APIReader client.Reader
 }
 
 // GetLogger returns a logger object with a prefix of "controller.name" and additional controller context fields
@@ -137,6 +139,7 @@ func (r *IronicReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	helper.SetAPIReader(r.APIReader)
 
 	// initialize status if Conditions is nil, but do not reset if it already
 	// exists
@@ -290,7 +293,7 @@ func (r *IronicReconciler) reconcileDelete(ctx context.Context, instance *ironic
 		instance.Status.ApplicationCredentialSecret,
 		instance.Spec.Auth.ApplicationCredentialSecret,
 	} {
-		if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			secretName, ironic.ACConsumerFinalizer); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -301,8 +304,25 @@ func (r *IronicReconciler) reconcileDelete(ctx context.Context, instance *ironic
 		instance.Status.InspectorApplicationCredentialSecret,
 		instance.Spec.IronicInspector.Auth.ApplicationCredentialSecret,
 	} {
-		if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			secretName, ironic.InspectorACConsumerFinalizer); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	if err := object.RemoveSecretConsumerFinalizer(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		ironic.TransportConsumerFinalizer,
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+	if instance.Status.NotificationsURLSecret != nil {
+		if err := object.RemoveSecretConsumerFinalizer(
+			ctx, helper, instance.Namespace,
+			*instance.Status.NotificationsURLSecret,
+			ironic.TransportConsumerFinalizer,
+		); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -333,6 +353,21 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 	// Initialize the IronicConductorReadyCount map
 	instance.Status.IronicConductorReadyCount = make(map[string]int32)
 
+	oldTransportSecret := instance.Status.TransportURLSecret
+	currentTransportSecret := ""
+
+	oldNotifSecret := ""
+	if instance.Status.NotificationsURLSecret != nil {
+		oldNotifSecret = *instance.Status.NotificationsURLSecret
+	}
+	currentNotifSecret := ""
+
+	// transportURLSecretName holds the current (possibly new) transport URL
+	// secret name and is passed to configmap generation and sub-CR creation
+	// instead of instance.Status.TransportURLSecret, so that sub-CRs
+	// immediately pick up a rotated secret.
+	transportURLSecretName := ""
+
 	if instance.Spec.RPCTransport == "oslo" {
 		//
 		// Create RabbitMQ transport URL CR for messaging and get the actual URL from the associated secret
@@ -358,9 +393,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			Log.Info(fmt.Sprintf("TransportURL %s successfully reconciled - operation: %s", transportURL.Name, string(op)))
 		}
 
-		instance.Status.TransportURLSecret = transportURL.Status.SecretName
-
-		if instance.Status.TransportURLSecret == "" {
+		if transportURL.Status.SecretName == "" {
 			Log.Info(fmt.Sprintf("Waiting for TransportURL %s secret to be created", transportURL.Name))
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.RabbitMqTransportURLReadyCondition,
@@ -368,6 +401,22 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 				condition.SeverityInfo,
 				condition.RabbitMqTransportURLReadyRunningMessage))
 			return ctrl.Result{}, nil
+		}
+
+		currentTransportSecret = transportURL.Status.SecretName
+		transportURLSecretName = currentTransportSecret
+
+		// Set status early for first-time setup so PatchInstance persists it
+		// even on early returns. During rotation (old != current), the status
+		// is only updated by FinalizeSecretRotation at end of reconcile.
+		if instance.Status.TransportURLSecret == "" ||
+			instance.Status.TransportURLSecret == currentTransportSecret {
+			instance.Status.TransportURLSecret = currentTransportSecret
+		}
+
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+			currentTransportSecret, ironic.TransportConsumerFinalizer); err != nil {
+			return ctrl.Result{}, err
 		}
 
 		instance.Status.Conditions.MarkTrue(condition.RabbitMqTransportURLReadyCondition, condition.RabbitMqTransportURLReadyMessage)
@@ -388,9 +437,20 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 		if err != nil || result.Requeue || result.RequeueAfter > 0 {
 			return result, err
 		}
+		if instance.Status.NotificationsURLSecret != nil {
+			currentNotifSecret = *instance.Status.NotificationsURLSecret
+		}
+		if currentNotifSecret != "" {
+			if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+				currentNotifSecret, ironic.TransportConsumerFinalizer); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 	} else {
 		instance.Status.TransportURLSecret = ""
 		instance.Status.NotificationsURLSecret = nil
+		currentTransportSecret = ""
+		currentNotifSecret = ""
 		instance.Status.Conditions.MarkTrue(condition.RabbitMqTransportURLReadyCondition, ironicv1.RabbitMqTransportURLDisabledMessage)
 	}
 	// end transportURL
@@ -477,7 +537,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 	// - %-config configmap holding minimal ironic config required to get the service up, user can add additional files to be added to the service
 	// - parameters which has passwords gets added from the OpenStack secret via the init container
 	//
-	err = r.generateServiceConfigMaps(ctx, instance, helper, &configMapVars, &keystoneEndpoints, keystoneRegion, db)
+	err = r.generateServiceConfigMaps(ctx, instance, helper, &configMapVars, &keystoneEndpoints, keystoneRegion, db, transportURLSecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -511,9 +571,8 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 	// Add consumer finalizer to the new ironic AC secret (early phase of the
 	// split pattern -- old secret finalizer removal is deferred to end of reconcile).
 	if instance.Spec.Auth.ApplicationCredentialSecret != "" {
-		if err := keystonev1.ManageACSecretFinalizer(ctx, helper, instance.Namespace,
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			instance.Spec.Auth.ApplicationCredentialSecret,
-			"",
 			ironic.ACConsumerFinalizer); err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.ServiceConfigReadyCondition,
@@ -527,9 +586,8 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 
 	// Add consumer finalizer to the new ironic-inspector AC secret.
 	if instance.Spec.IronicInspector.Auth.ApplicationCredentialSecret != "" {
-		if err := keystonev1.ManageACSecretFinalizer(ctx, helper, instance.Namespace,
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			instance.Spec.IronicInspector.Auth.ApplicationCredentialSecret,
-			"",
 			ironic.InspectorACConsumerFinalizer); err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.ServiceConfigReadyCondition,
@@ -559,7 +617,12 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 	// normal reconcile tasks
 	//
 
+	allSubCRsStable := true
+	rotationInProgress := oldTransportSecret != "" &&
+		oldTransportSecret != currentTransportSecret
+
 	// deploy ironic-conductors
+	waitingConductorGenerationMatch := false
 	for _, conductorSpec := range instance.Spec.IronicConductors {
 
 		ironicConductor, op, err := r.conductorDeploymentCreateOrUpdate(
@@ -567,6 +630,7 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			conductorSpec,
 			&keystoneEndpoints,
 			keystoneRegion,
+			transportURLSecretName,
 		)
 		if err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
@@ -577,26 +641,13 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 				err.Error()))
 			return ctrl.Result{}, err
 		}
-
-		// Check the observed Generation and mirror the condition from the
-		// underlying resource reconciliation
-		cndObsGen, err := r.checkIronicConductorGeneration(instance)
-		if err != nil {
-			instance.Status.Conditions.Set(condition.FalseCondition(
-				ironicv1.IronicConductorReadyCondition,
-				condition.ErrorReason,
-				condition.SeverityWarning,
-				ironicv1.IronicConductorReadyErrorMessage,
-				err.Error()))
+		if err := helper.EnsureFresh(ctx, op, ironicConductor, rotationInProgress); err != nil {
 			return ctrl.Result{}, err
 		}
-		if !cndObsGen {
-			instance.Status.Conditions.Set(condition.UnknownCondition(
-				ironicv1.IronicConductorReadyCondition,
-				condition.InitReason,
-				ironicv1.IronicConductorReadyInitMessage,
-			))
-		} else {
+		if op != controllerutil.OperationResultNone {
+			allSubCRsStable = false
+		}
+		if ironicConductor.Generation == ironicConductor.Status.ObservedGeneration {
 			// Mirror IronicConductor status' ReadyCount to this parent CR
 			condGrp := conductorSpec.ConductorGroup
 			if conductorSpec.ConductorGroup == "" {
@@ -611,11 +662,20 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			if op != controllerutil.OperationResultNone {
 				Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicConductor.Name, string(op)))
 			}
+		} else {
+			waitingConductorGenerationMatch = true
 		}
+	}
+	if waitingConductorGenerationMatch {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			ironicv1.IronicConductorReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	// deploy ironic-api
-	ironicAPI, op, err := r.apiDeploymentCreateOrUpdate(instance, &keystoneEndpoints, keystoneRegion)
+	ironicAPI, op, err := r.apiDeploymentCreateOrUpdate(instance, &keystoneEndpoints, keystoneRegion, transportURLSecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			ironicv1.IronicAPIReadyCondition,
@@ -625,28 +685,13 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			err.Error()))
 		return ctrl.Result{}, err
 	}
-
-	// Check the observed Generation and mirror the condition from the
-	// underlying resource reconciliation
-	apiObsGen, err := r.checkIronicAPIGeneration(instance)
-	if err != nil {
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			ironicv1.IronicAPIReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			ironicv1.IronicAPIReadyErrorMessage,
-			err.Error()))
+	if err := helper.EnsureFresh(ctx, op, ironicAPI, rotationInProgress); err != nil {
 		return ctrl.Result{}, err
 	}
-	// Only mirror the underlying condition if the observedGeneration is
-	// the last seen
-	if !apiObsGen {
-		instance.Status.Conditions.Set(condition.UnknownCondition(
-			ironicv1.IronicAPIReadyCondition,
-			condition.InitReason,
-			ironicv1.IronicAPIReadyInitMessage,
-		))
-	} else {
+	if op != controllerutil.OperationResultNone {
+		allSubCRsStable = false
+	}
+	if ironicAPI.Generation == ironicAPI.Status.ObservedGeneration {
 		// Mirror IronicAPI status' APIEndpoints and ReadyCount to this parent CR
 		maps.Copy(instance.Status.APIEndpoints, ironicAPI.Status.APIEndpoints)
 		instance.Status.IronicAPIReadyCount = ironicAPI.Status.ReadyCount
@@ -659,6 +704,12 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 		if op != controllerutil.OperationResultNone {
 			Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicAPI.Name, string(op)))
 		}
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			ironicv1.IronicAPIReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	// deploy ironic-inspector
@@ -674,29 +725,13 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 					err.Error()))
 			return ctrl.Result{}, err
 		}
-
-		// Check the observed Generation and mirror the condition from the
-		// underlying resource reconciliation
-		nspObsGen, err := r.checkIronicInspectorGeneration(instance)
-		if err != nil {
-			instance.Status.Conditions.Set(
-				condition.FalseCondition(
-					ironicv1.IronicInspectorReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					ironicv1.IronicInspectorReadyErrorMessage,
-					err.Error()))
+		if err := helper.EnsureFresh(ctx, op, ironicInspector, rotationInProgress); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Only mirror the underlying condition if the observedGeneration is
-		// the last seen
-		if !nspObsGen {
-			instance.Status.Conditions.Set(condition.UnknownCondition(
-				ironicv1.IronicInspectorReadyCondition,
-				condition.InitReason,
-				ironicv1.IronicInspectorReadyInitMessage,
-			))
-		} else {
+		if op != controllerutil.OperationResultNone {
+			allSubCRsStable = false
+		}
+		if ironicInspector.Generation == ironicInspector.Status.ObservedGeneration {
 			// Mirror IronicInspector status APIEndpoints and ReadyCount to this parent CR
 			maps.Copy(instance.Status.APIEndpoints, ironicInspector.Status.APIEndpoints)
 			instance.Status.InspectorReadyCount = ironicInspector.Status.ReadyCount
@@ -709,6 +744,12 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			if op != controllerutil.OperationResultNone {
 				Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicInspector.Name, string(op)))
 			}
+		} else {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				ironicv1.IronicInspectorReadyCondition,
+				condition.RequestedReason,
+				condition.SeverityInfo,
+				condition.DeploymentReadyRunningMessage))
 		}
 	} else {
 		err := r.inspectorDeploymentDelete(ctx, instance)
@@ -738,29 +779,13 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 					err.Error()))
 			return ctrl.Result{}, err
 		}
-
-		// Check the observed Generation and mirror the condition from the
-		// underlying resource reconciliation
-		agObsGen, err := r.checkNeutronAgentGeneration(instance)
-		if err != nil {
-			instance.Status.Conditions.Set(
-				condition.FalseCondition(
-					ironicv1.IronicNeutronAgentReadyCondition,
-					condition.ErrorReason,
-					condition.SeverityWarning,
-					ironicv1.IronicNeutronAgentReadyErrorMessage,
-					err.Error()))
+		if err := helper.EnsureFresh(ctx, op, ironicNeutronAgent, rotationInProgress); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Only mirror the underlying condition if the observedGeneration is
-		// the last seen
-		if !agObsGen {
-			instance.Status.Conditions.Set(condition.UnknownCondition(
-				ironicv1.IronicNeutronAgentReadyCondition,
-				condition.InitReason,
-				ironicv1.IronicNeutronAgentReadyInitMessage,
-			))
-		} else {
+		if op != controllerutil.OperationResultNone {
+			allSubCRsStable = false
+		}
+		if ironicNeutronAgent.Generation == ironicNeutronAgent.Status.ObservedGeneration {
 			// Mirror IronicNeutronAgent status ReadyCount to this parent CR
 			instance.Status.IronicNeutronAgentReadyCount = ironicNeutronAgent.Status.ReadyCount
 			// Mirror IronicNeutronAgent's condition status
@@ -771,6 +796,12 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 			if op != controllerutil.OperationResultNone {
 				Log.Info(fmt.Sprintf("Deployment %s successfully reconciled - operation: %s", ironicNeutronAgent.Name, string(op)))
 			}
+		} else {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				ironicv1.IronicNeutronAgentReadyCondition,
+				condition.RequestedReason,
+				condition.SeverityInfo,
+				condition.DeploymentReadyRunningMessage))
 		}
 	} else {
 		err := r.ironicNeutronAgentDeploymentDelete(ctx, instance)
@@ -792,14 +823,24 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 		return ctrl.Result{}, err
 	}
 
+	// When sub-CRs were just updated, their conditions haven't been
+	// persisted yet (PatchInstance race). Requeue to let them process
+	// before evaluating the rotation guard.
+	if !allSubCRsStable {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
 	// Late phase of the AC split pattern: remove the old AC secret's finalizer
 	// and update status only after all sub-services are ready with the new
 	// credentials. This prevents premature revocation during rapid rotations.
+	guardReady := condition.CredentialRotationGuardReady(
+		allSubCRsStable, &instance.Status.Conditions)
+
 	isIronicRotation := instance.Status.ApplicationCredentialSecret != "" &&
 		instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret
 	if isIronicRotation {
-		if instance.Status.Conditions.AllSubConditionIsTrue() {
-			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		if guardReady {
+			if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 				instance.Status.ApplicationCredentialSecret, ironic.ACConsumerFinalizer); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -812,8 +853,8 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 	isInspectorRotation := instance.Status.InspectorApplicationCredentialSecret != "" &&
 		instance.Status.InspectorApplicationCredentialSecret != instance.Spec.IronicInspector.Auth.ApplicationCredentialSecret
 	if isInspectorRotation {
-		if instance.Status.Conditions.AllSubConditionIsTrue() {
-			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		if guardReady {
+			if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 				instance.Status.InspectorApplicationCredentialSecret, ironic.InspectorACConsumerFinalizer); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -821,6 +862,36 @@ func (r *IronicReconciler) reconcileNormal(ctx context.Context, instance *ironic
 		}
 	} else {
 		instance.Status.InspectorApplicationCredentialSecret = instance.Spec.IronicInspector.Auth.ApplicationCredentialSecret
+	}
+
+	// Finalize transport URL secret rotation
+	transportSecretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		oldTransportSecret,
+		currentTransportSecret,
+		ironic.TransportConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	instance.Status.TransportURLSecret = transportSecretName
+
+	// Finalize notifications URL secret rotation
+	notifSecretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		oldNotifSecret,
+		currentNotifSecret,
+		ironic.TransportConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if currentNotifSecret != "" {
+		instance.Status.NotificationsURLSecret = &notifSecretName
+	} else {
+		instance.Status.NotificationsURLSecret = nil
 	}
 
 	// We reached the end of the Reconcile, update the Ready condition based on
@@ -893,6 +964,7 @@ func (r *IronicReconciler) conductorDeploymentCreateOrUpdate(
 	conductorSpec ironicv1.IronicConductorTemplate,
 	keystoneEndpoints *ironicv1.KeystoneEndpoints,
 	keystoneRegion string,
+	transportURLSecretName string,
 ) (*ironicv1.IronicConductor, controllerutil.OperationResult, error) {
 	name := fmt.Sprintf("%s-%s", instance.Name, ironic.ConductorComponent)
 	if conductorSpec.ConductorGroup != "" {
@@ -911,7 +983,7 @@ func (r *IronicReconciler) conductorDeploymentCreateOrUpdate(
 		ServiceUser:             instance.Spec.ServiceUser,
 		DatabaseAccount:         instance.Spec.DatabaseAccount,
 		DatabaseHostname:        instance.Status.DatabaseHostname,
-		TransportURLSecret:      instance.Status.TransportURLSecret,
+		TransportURLSecret:      transportURLSecretName,
 		KeystoneEndpoints:       *keystoneEndpoints,
 		Region:                  keystoneRegion,
 		TLS:                     instance.Spec.IronicAPI.TLS.Ca,
@@ -958,6 +1030,7 @@ func (r *IronicReconciler) apiDeploymentCreateOrUpdate(
 	instance *ironicv1.Ironic,
 	keystoneEndpoints *ironicv1.KeystoneEndpoints,
 	keystoneRegion string,
+	transportURLSecretName string,
 ) (*ironicv1.IronicAPI, controllerutil.OperationResult, error) {
 	IronicAPISpec := ironicv1.IronicAPISpec{
 		IronicAPITemplate:  instance.Spec.IronicAPI,
@@ -969,7 +1042,7 @@ func (r *IronicReconciler) apiDeploymentCreateOrUpdate(
 		ServiceUser:        instance.Spec.ServiceUser,
 		DatabaseAccount:    instance.Spec.DatabaseAccount,
 		DatabaseHostname:   instance.Status.DatabaseHostname,
-		TransportURLSecret: instance.Status.TransportURLSecret,
+		TransportURLSecret: transportURLSecretName,
 		KeystoneEndpoints:  *keystoneEndpoints,
 		Region:             keystoneRegion,
 		Auth:               instance.Spec.Auth,
@@ -1023,6 +1096,7 @@ func (r *IronicReconciler) generateServiceConfigMaps(
 	keystoneEndpoints *ironicv1.KeystoneEndpoints,
 	keystoneRegion string,
 	db *mariadbv1.Database,
+	transportURLSecretName string,
 ) error {
 	Log := r.GetLogger(ctx)
 
@@ -1059,7 +1133,7 @@ func (r *IronicReconciler) generateServiceConfigMaps(
 	// Initialize ConductorGroup key to ensure template rendering does not fail
 	templateParameters["ConductorGroup"] = nil
 
-	transportURL, err := r.getTransportURL(ctx, h, instance)
+	transportURL, err := r.getTransportURL(ctx, h, instance, transportURLSecretName)
 	if err != nil {
 		return err
 	}
@@ -1072,7 +1146,7 @@ func (r *IronicReconciler) generateServiceConfigMaps(
 
 	quorumQueues := false
 	if instance.Spec.RPCTransport == "oslo" {
-		quorumQueues, err = getQuorumQueues(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
+		quorumQueues, err = getQuorumQueues(ctx, h, transportURLSecretName, instance.Namespace)
 		if err != nil {
 			return err
 		}
@@ -1150,11 +1224,12 @@ func (r *IronicReconciler) getTransportURL(
 	ctx context.Context,
 	h *helper.Helper,
 	instance *ironicv1.Ironic,
+	transportURLSecretName string,
 ) (string, error) {
 	if instance.Spec.RPCTransport != "oslo" {
 		return "fake://", nil
 	}
-	transportURLSecret, _, err := oko_secret.GetSecret(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
+	transportURLSecret, _, err := oko_secret.GetSecret(ctx, h, transportURLSecretName, instance.Namespace)
 	if err != nil {
 		return "", err
 	}

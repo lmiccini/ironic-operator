@@ -60,6 +60,7 @@ import (
 
 	"github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -78,8 +79,9 @@ import (
 // IronicInspectorReconciler reconciles a IronicInspector object
 type IronicInspectorReconciler struct {
 	client.Client
-	Kclient kubernetes.Interface
-	Scheme  *runtime.Scheme
+	Kclient   kubernetes.Interface
+	Scheme    *runtime.Scheme
+	APIReader client.Reader
 }
 
 var inspectorKeystoneServices = []map[string]string{
@@ -153,6 +155,7 @@ func (r *IronicInspectorReconciler) Reconcile(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	helper.SetAPIReader(r.APIReader)
 
 	// initialize status if Conditions is nil, but do not reset if it already
 	// exists
@@ -523,8 +526,8 @@ func (r *IronicInspectorReconciler) transportURLCreateOrUpdate(
 func (r *IronicInspectorReconciler) reconcileTransportURL(
 	ctx context.Context,
 	instance *ironicv1.IronicInspector,
-	_ *helper.Helper,
-) (ctrl.Result, error) {
+	h *helper.Helper,
+) (string, ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 
 	if instance.Spec.RPCTransport == "oslo" {
@@ -545,7 +548,7 @@ func (r *IronicInspectorReconciler) reconcileTransportURL(
 				condition.RabbitMqTransportURLReadyErrorMessage,
 				err.Error(),
 			))
-			return ctrl.Result{}, err
+			return "", ctrl.Result{}, err
 		}
 
 		if op != controllerutil.OperationResultNone {
@@ -554,9 +557,7 @@ func (r *IronicInspectorReconciler) reconcileTransportURL(
 				transportURL.Name, string(op)))
 		}
 
-		instance.Status.TransportURLSecret = transportURL.Status.SecretName
-
-		if instance.Status.TransportURLSecret == "" {
+		if transportURL.Status.SecretName == "" {
 			Log.Info(fmt.Sprintf(
 				"Waiting for TransportURL %s secret to be created",
 				transportURL.Name))
@@ -565,7 +566,20 @@ func (r *IronicInspectorReconciler) reconcileTransportURL(
 				condition.RequestedReason,
 				condition.SeverityInfo,
 				condition.RabbitMqTransportURLReadyRunningMessage))
-			return ctrl.Result{}, nil
+			return "", ctrl.Result{}, nil
+		}
+
+		if err := object.ManageSecretConsumerFinalizer(
+			ctx, h, instance.Namespace,
+			transportURL.Status.SecretName,
+			ironic.InspectorTransportConsumerFinalizer,
+		); err != nil {
+			return "", ctrl.Result{}, err
+		}
+
+		if instance.Status.TransportURLSecret == "" ||
+			instance.Status.TransportURLSecret == transportURL.Status.SecretName {
+			instance.Status.TransportURLSecret = transportURL.Status.SecretName
 		}
 
 		instance.Status.Conditions.MarkTrue(
@@ -586,18 +600,33 @@ func (r *IronicInspectorReconciler) reconcileTransportURL(
 			Log,
 		)
 		if err != nil || result.Requeue || result.RequeueAfter > 0 {
-			return result, err
+			return "", result, err
 		}
-	} else {
-		instance.Status.TransportURLSecret = ""
-		instance.Status.NotificationsURLSecret = nil
-		instance.Status.Conditions.MarkTrue(
-			condition.RabbitMqTransportURLReadyCondition,
-			ironicv1.RabbitMqTransportURLDisabledMessage)
+		newNotifSecret := ""
+		if instance.Status.NotificationsURLSecret != nil {
+			newNotifSecret = *instance.Status.NotificationsURLSecret
+		}
+		if newNotifSecret != "" {
+			if err := object.ManageSecretConsumerFinalizer(
+				ctx, h, instance.Namespace,
+				newNotifSecret,
+				ironic.InspectorTransportConsumerFinalizer,
+			); err != nil {
+				return "", ctrl.Result{}, err
+			}
+		}
+
+		return transportURL.Status.SecretName, ctrl.Result{}, nil
 	}
+
+	instance.Status.TransportURLSecret = ""
+	instance.Status.NotificationsURLSecret = nil
+	instance.Status.Conditions.MarkTrue(
+		condition.RabbitMqTransportURLReadyCondition,
+		ironicv1.RabbitMqTransportURLDisabledMessage)
 	// transportURL - end
 
-	return ctrl.Result{}, nil
+	return "", ctrl.Result{}, nil
 }
 
 func (r *IronicInspectorReconciler) reconcileConfigMapsAndSecrets(
@@ -958,7 +987,7 @@ func (r *IronicInspectorReconciler) reconcileNormal(
 		}
 	}
 
-	ctrlResult, err := r.reconcileTransportURL(ctx, instance, helper)
+	newTransportURLSecret, ctrlResult, err := r.reconcileTransportURL(ctx, instance, helper)
 	if err != nil {
 		return ctrlResult, err
 	} else if (ctrlResult != ctrl.Result{}) {
@@ -1046,6 +1075,20 @@ func (r *IronicInspectorReconciler) reconcileNormal(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+
+	guardReady := condition.CredentialRotationGuardReady(true, &instance.Status.Conditions)
+
+	secretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		newTransportURLSecret,
+		ironic.InspectorTransportConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	instance.Status.TransportURLSecret = secretName
 
 	// We reached the end of the Reconcile, update the Ready condition based on
 	// the sub conditions
@@ -1149,6 +1192,24 @@ func (r *IronicInspectorReconciler) reconcileDelete(
 	); err != nil {
 		return ctrlResult, err
 	}
+
+	if err := object.RemoveSecretConsumerFinalizer(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		ironic.InspectorTransportConsumerFinalizer,
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+	if instance.Status.NotificationsURLSecret != nil {
+		if err := object.RemoveSecretConsumerFinalizer(
+			ctx, helper, instance.Namespace,
+			*instance.Status.NotificationsURLSecret,
+			ironic.InspectorTransportConsumerFinalizer,
+		); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Service is deleted so remove the finalizer.
 	controllerutil.RemoveFinalizer(instance, helper.GetFinalizer())
 	Log.Info("Reconciled Ironic Inspector delete successfully")
